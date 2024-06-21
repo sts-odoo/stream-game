@@ -9,6 +9,7 @@ Options:
 """
 import subprocess
 import os
+import signal
 import sys
 import time
 import requests
@@ -43,9 +44,11 @@ INPUT_CAMERA_STREAM_FIELD2 = config.has_option('baseball', 'input_stream_2') and
 
 FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
 
-YOUTUBE_STREAM_KEY = config.get('baseball', 'output_stream_key')
+MAIN_STREAM = config.get('baseball', 'main_rtmp_stream')
+BACKUP_STREAM = config.has_option('baseball', 'backup_rtmp_stream') and config.get('baseball', 'backup_rtmp_stream')
+
 LOGFILE = config.has_option('baseball', 'logfile') and config.get('baseball', 'logfile')
-RESOLUTION = (2560, 1440)
+INPUT_RESOLUTION = (2560, 1440)
 
 PHOTO_WIDTH = 470
 
@@ -153,7 +156,7 @@ class Team:
 
 
 class Game:
-    def __init__(self, game_info, mode='live', replay_mode=None, resolution=RESOLUTION):
+    def __init__(self, game_info, mode='live', replay_mode='realtime', resolution=INPUT_RESOLUTION):
         gameid = game_info.get('live_score_id')
         self.id = gameid
         self.resolution = resolution
@@ -162,13 +165,23 @@ class Game:
         self.stream_proc = None
         self.game_started = False
         self.game_info = game_info
+        self.logfile = open(LOGFILE, 'a') if LOGFILE else None
+        self.initialize_stream()
         self.init_game()
 
     def init_game(self):
         try:
             self.session = requests.Session()
-            data = self.session.get(PLAY_URL % (self.id, 1), headers=HEADERS)
-            data = data.json()
+            if self.mode == 'live':
+                last_play = self.session.get(LATEST_PLAY_URL % self.id, headers=HEADERS)
+                last_play = int(last_play.json())
+                self.current_play = last_play
+                data = self.session.get(PLAY_URL % (self.id, last_play), headers=HEADERS)
+                data = data.json()
+            else:
+                self.current_play = 1
+                data = self.session.get(PLAY_URL % (self.id, 1), headers=HEADERS)
+                data = data.json()
             self.beginning = int(data.get('playdata')[0].get('t'))
             self.data = data
             home_id = data.get('eventhomeid')
@@ -177,10 +190,9 @@ class Game:
             self.home = Team(self, home_id, data.get('eventhome'), players, self.game_info.get('home_logo'), hex2rgb(self.game_info.get('home_primary_color')), hex2rgb(self.game_info.get('home_secondary_color')))
             self.away = Team(self, away_id, data.get('eventaway'), players, self.game_info.get('away_logo'), hex2rgb(self.game_info.get('away_primary_color')), hex2rgb(self.game_info.get('away_secondary_color')))
             self.update_game(data)
-            self.current_play = 1
             self.game_started = True
         except Exception:
-            logger.error('Could not initialize game from wbsc')
+            logger.exception('Could not initialize game from wbsc')
 
     def update_game(self, data):
         self.data = data
@@ -422,19 +434,23 @@ class Game:
             '-map', '[outv]',
             '-map', '0:a',
             '-c:a', 'aac',
+            '-b:a', '128k',
             '-strict', 'experimental',
             '-f', 'flv',
-            '-b:v', '12000k',
+            '-b:v', '8000k',
             '-vcodec', 'h264',
             '-preset', 'ultrafast',
-            f'rtmp://a.rtmp.youtube.com/live2/{YOUTUBE_STREAM_KEY}',
+            '-g', '60',
+            '-s', '1920x1080',
         ]
-        self.stream_proc = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+
+        self.stream_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
+        if BACKUP_STREAM:
+            self.backup_proc = subprocess.Popen(command + [f'{BACKUP_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
 
     def run(self):
         start = int(time.time() * 1000)
         self.make_overlay()
-        self.initialize_stream()
         time.sleep(10)
         while True:
             if not self.game_started:
@@ -485,21 +501,29 @@ class Game:
                 self.update_game(data)
                 self.make_overlay()
                 time.sleep(3)
-        self.stream_proc.kill()
+        self.cleanup()
 
+    def cleanup(self):
+        logger.info("Cleaning up...")
+        if hasattr(self, 'stream_proc') and self.stream_proc.poll() is None:
+            self.stream_proc.terminate()
+            try:
+                self.stream_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.stream_proc.kill()
+            logger.info("FFmpeg process terminated.")
+        if hasattr(self, 'backup_proc') and self.backup_proc.poll() is None:
+            self.backup_proc.terminate()
+            try:
+                self.backup_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.backup_proc.kill()
+            logger.info("Backup FFmpeg process terminated.")
+        if self.logfile:
+            self.logfile.close()
 
 def main():
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    logging.basicConfig(level=logging.INFO, filename=LOGFILE, filemode='a')
-    if LOGFILE:
-        file_handler = logging.FileHandler(LOGFILE)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    else:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename=LOGFILE, filemode='a')
     logger.info('Starting service')
     while True:
         try:
@@ -512,10 +536,15 @@ def main():
         if current_score.get('game') and current_score.get('live_score_id') and current_score.get('youtube_video_id'):
             logger.info('Found game %s - starting stream', current_score.get('live_score_id'))
             try:
-                if config.has_option('baseball', 'replay') and config.get('baseball', 'replay'):
-                    game = Game(current_score, mode='replay', replay_mode='sequence')
-                else:
-                    game = Game(current_score)
+                replay_mode = config.has_option('baseball', 'replay_mode') and config.get('baseball', 'replay_mode')
+                game = Game(current_score, mode=config.get('baseball', 'mode'), replay_mode=replay_mode)
+
+                def signal_handler(sig, frame):
+                    logger.info("Signal received: %s", sig)
+                    game.cleanup()
+                    os._exit(0)
+                signal.signal(signal.SIGINT, signal_handler)
+                signal.signal(signal.SIGTERM, signal_handler)
                 game.run()
             except Exception:
                 logger.exception('Failed to start game, retrying in 60s')
