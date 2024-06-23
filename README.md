@@ -29,7 +29,7 @@ input_stream_1 = rtsp camera 1
 input_stream_2 = rtsp camera 2
 main_rtmp_stream = main rtmp stream (rtmp://a.rtmp.youtube.com/live2/STREAMKEY)
 backup_rtmp_stream = if defined use as backup rtmp stream (rtmp://b.rtmp.youtube.com/live2?backup=1/STREAMKEY)
-mode = realtime|replay
+mode = live|replay
 
 
 ```

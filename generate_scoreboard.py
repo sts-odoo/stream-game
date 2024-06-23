@@ -452,6 +452,7 @@ class Game:
         start = int(time.time() * 1000)
         self.make_overlay()
         time.sleep(10)
+        end_time = None
         while True:
             if not self.game_started:
                 self.init_game()
@@ -460,7 +461,12 @@ class Game:
                 continue
             logger.info('Play %s', self.current_play)
             if self.inning == 'F':
-                break
+                if not end_time:
+                    end_time = time.time()
+                elif time.time() - end_time > 120:
+                    break
+            else:
+                end_time = None
             if self.mode == 'replay' and self.replay_mode == 'realtime':
                 current_time = self.beginning + (int(time.time() * 1000) - start)
                 while self.play_time < current_time:
@@ -550,7 +556,7 @@ def main():
                 logger.exception('Failed to start game, retrying in 60s')
                 time.sleep(60)
 
-        time.sleep(5)
+        time.sleep(60)
 
 
 if __name__ == "__main__":
