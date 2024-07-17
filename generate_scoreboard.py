@@ -180,7 +180,7 @@ class Game:
                 data = data.json()
             else:
                 self.current_play = 1
-                data = self.session.get(PLAY_URL % (self.id, 1), headers=HEADERS)
+                data = self.session.get(PLAY_URL % (self.id, self.current_play), headers=HEADERS)
                 data = data.json()
             self.beginning = int(data.get('playdata')[0].get('t'))
             self.data = data
@@ -419,7 +419,32 @@ class Game:
         image.save(os.path.join(WORKING_DIR, 'overlay-tmp.png'), "PNG")
         os.replace(os.path.join(WORKING_DIR, 'overlay-tmp.png'), os.path.join(WORKING_DIR, 'overlay.png'))
 
-    def initialize_stream(self):
+    def start_video_file(self, file, duration=None):
+        command = [
+            'ffmpeg',
+            '-re',
+            '-i', file,
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-strict', 'experimental',
+            '-f', 'flv',
+            '-b:v', '8000k',
+            '-vcodec', 'h264',
+            '-preset', 'ultrafast',
+            '-g', '60',
+            '-s', '1920x1080',
+        ]
+        video_file_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
+        if duration:
+            time.sleep(duration)
+            video_file_proc.terminate()
+        else:
+            video_file_proc.wait()
+
+    def initialize_stream(self, restart=False):
+        if config.has_option('baseball', 'intro_file') and not restart:
+            logger.info("Starting intro file.")
+            self.start_video_file(config.get('baseball', 'intro_file'))
 
         command = [
             'ffmpeg',
@@ -445,8 +470,15 @@ class Game:
         ]
 
         self.stream_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
-        if BACKUP_STREAM:
+        if BACKUP_STREAM and not restart:
             self.backup_proc = subprocess.Popen(command + [f'{BACKUP_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
+
+    def check_stream(self):
+        if self.stream_proc:
+             retcode = self.stream_proc.poll()
+             if retcode:
+                logger.info('FFmpeg failed for an unknown reason (return code %s), restarting', retcode)
+                self.initialize_stream(restart=True)
 
     def run(self):
         start = int(time.time() * 1000)
@@ -459,8 +491,11 @@ class Game:
                 logger.info('Game has not started yet, waiting 30s then retrying')
                 time.sleep(30)
                 continue
+            self.check_stream()
             logger.info('Play %s', self.current_play)
             if self.inning == 'F':
+                if self.mode == 'replay':
+                    break
                 if not end_time:
                     end_time = time.time()
                 elif time.time() - end_time > 120:
@@ -508,6 +543,9 @@ class Game:
                 self.make_overlay()
                 time.sleep(3)
         self.cleanup()
+        if config.has_option('baseball', 'end_file'):
+            logger.info("Starting end file. %s", config.get('baseball', 'end_file'))
+            self.start_video_file(config.get('baseball', 'end_file'))
 
     def cleanup(self):
         logger.info("Cleaning up...")
@@ -548,6 +586,8 @@ def main():
                 def signal_handler(sig, frame):
                     logger.info("Signal received: %s", sig)
                     game.cleanup()
+                    if game.logfile:
+                        game.logfile.close()
                     os._exit(0)
                 signal.signal(signal.SIGINT, signal_handler)
                 signal.signal(signal.SIGTERM, signal_handler)

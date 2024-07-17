@@ -28,9 +28,11 @@ logfile = if defined use log file else use stdout
 input_stream_1 = rtsp camera 1
 input_stream_2 = rtsp camera 2
 main_rtmp_stream = main rtmp stream (rtmp://a.rtmp.youtube.com/live2/STREAMKEY)
-backup_rtmp_stream = if defined use as backup rtmp stream (rtmp://b.rtmp.youtube.com/live2?backup=1/STREAMKEY)
 mode = live|replay
-
+# Optional configuration options
+backup_rtmp_stream = if defined use as backup rtmp stream (rtmp://b.rtmp.youtube.com/live2?backup=1/STREAMKEY)
+intro_file = if defined start stream with a video (path to file)
+end_file = if defined end stream with a video (path to file)
 
 ```
 The website website_url is supposed to have a route /game/current_score which return a json containing
