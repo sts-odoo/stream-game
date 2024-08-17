@@ -37,15 +37,8 @@ BASE_URL = 'https://game.wbsc.org/gamedata'
 LATEST_PLAY_URL = '%s/%%s/latest.json' % (BASE_URL)
 PLAY_URL = '%s/%%s/play%%s.json' % (BASE_URL)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36"}
-FIELD_IMAGE = 'https://static.wbsc.org/public/wbsc/images/baseball-field.svg'
-# STATS https://www.wbsc.org/api/v1/player/stats?tab=charts&fedId=143&eventId=2115&roundId=all&gameId=all&pId=649920&teamId=29254
-INPUT_CAMERA_STREAM_FIELD1 = config.has_option('baseball', 'input_stream_1') and config.get('baseball', 'input_stream_1')
-INPUT_CAMERA_STREAM_FIELD2 = config.has_option('baseball', 'input_stream_2') and config.get('baseball', 'input_stream_2')
 
 FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
-
-MAIN_STREAM = config.get('baseball', 'main_rtmp_stream')
-BACKUP_STREAM = config.has_option('baseball', 'backup_rtmp_stream') and config.get('baseball', 'backup_rtmp_stream')
 
 LOGFILE = config.has_option('baseball', 'logfile') and config.get('baseball', 'logfile')
 INPUT_RESOLUTION = (2560, 1440)
@@ -166,7 +159,6 @@ class Game:
         self.game_started = False
         self.game_info = game_info
         self.logfile = open(LOGFILE, 'a') if LOGFILE else None
-        self.initialize_stream()
         self.init_game()
 
     def init_game(self):
@@ -249,7 +241,7 @@ class Game:
             average = '%.3f' % average
             if average.startswith('0'):
                 average = average[1:]
-            player_label = 'This season: %s avg' % average
+            player_label = 'This tournament: %s avg' % average
             for stat, label in [('H', 'H'), ('DOUBLE', '2B'), ('TRIPLE', '3B'), ('HR', 'HR'), ('BB', 'BB')]:
                 if self.batter.stats.get(stat) != '0':
                     player_label += ', %s %s' % (self.batter.stats.get(stat), label)
@@ -415,70 +407,11 @@ class Game:
             away_lineup = away_lineup.resize((int(away_lineup.size[0] * ratio), int(away_lineup.size[1] * ratio)))
             image.paste(home_lineup, (int(self.resolution[0] / 2 + 100), 100), home_lineup)
             image.paste(away_lineup, (int(self.resolution[0] / 2 - 100 - away_lineup.size[0]), 100), away_lineup)
+            image.save(os.path.join(WORKING_DIR, 'lineup-tmp.png'), "PNG")
+            os.replace(os.path.join(WORKING_DIR, 'lineup-tmp.png'), os.path.join(WORKING_DIR, 'lineup.png'))
 
         image.save(os.path.join(WORKING_DIR, 'overlay-tmp.png'), "PNG")
         os.replace(os.path.join(WORKING_DIR, 'overlay-tmp.png'), os.path.join(WORKING_DIR, 'overlay.png'))
-
-    def start_video_file(self, file, duration=None):
-        command = [
-            'ffmpeg',
-            '-re',
-            '-i', file,
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-strict', 'experimental',
-            '-f', 'flv',
-            '-b:v', '8000k',
-            '-vcodec', 'h264',
-            '-preset', 'ultrafast',
-            '-g', '60',
-            '-s', '1920x1080',
-        ]
-        video_file_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
-        if duration:
-            time.sleep(duration)
-            video_file_proc.terminate()
-        else:
-            video_file_proc.wait()
-
-    def initialize_stream(self, restart=False):
-        if config.has_option('baseball', 'intro_file') and not restart:
-            logger.info("Starting intro file.")
-            self.start_video_file(config.get('baseball', 'intro_file'))
-
-        command = [
-            'ffmpeg',
-            '-re',
-            '-rtsp_transport', 'tcp',
-            '-i', INPUT_CAMERA_STREAM_FIELD1 if self.game_info.get('camera') == 'camera1' else INPUT_CAMERA_STREAM_FIELD2,
-            '-f', 'image2',
-            '-framerate', '3',
-            '-loop', '1',
-            '-i', os.path.join(WORKING_DIR, 'overlay.png'),
-            '-filter_complex', '[0:v][1:v]overlay[outv]',
-            '-map', '[outv]',
-            '-map', '0:a',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-strict', 'experimental',
-            '-f', 'flv',
-            '-b:v', '8000k',
-            '-vcodec', 'h264',
-            '-preset', 'ultrafast',
-            '-g', '60',
-            '-s', '1920x1080',
-        ]
-
-        self.stream_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
-        if BACKUP_STREAM and not restart:
-            self.backup_proc = subprocess.Popen(command + [f'{BACKUP_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
-
-    def check_stream(self):
-        if self.stream_proc:
-             retcode = self.stream_proc.poll()
-             if retcode:
-                logger.info('FFmpeg failed for an unknown reason (return code %s), restarting', retcode)
-                self.initialize_stream(restart=True)
 
     def run(self):
         start = int(time.time() * 1000)
@@ -491,7 +424,6 @@ class Game:
                 logger.info('Game has not started yet, waiting 30s then retrying')
                 time.sleep(30)
                 continue
-            self.check_stream()
             logger.info('Play %s', self.current_play)
             if self.inning == 'F':
                 if self.mode == 'replay':
@@ -543,26 +475,8 @@ class Game:
                 self.make_overlay()
                 time.sleep(3)
         self.cleanup()
-        if config.has_option('baseball', 'end_file'):
-            logger.info("Starting end file. %s", config.get('baseball', 'end_file'))
-            self.start_video_file(config.get('baseball', 'end_file'))
 
     def cleanup(self):
-        logger.info("Cleaning up...")
-        if hasattr(self, 'stream_proc') and self.stream_proc.poll() is None:
-            self.stream_proc.terminate()
-            try:
-                self.stream_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.stream_proc.kill()
-            logger.info("FFmpeg process terminated.")
-        if hasattr(self, 'backup_proc') and self.backup_proc.poll() is None:
-            self.backup_proc.terminate()
-            try:
-                self.backup_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.backup_proc.kill()
-            logger.info("Backup FFmpeg process terminated.")
         if self.logfile:
             self.logfile.close()
 
@@ -577,8 +491,8 @@ def main():
             logger.info('Got current score %s', current_score)
         except requests.HTTPError:
             logger.exception('Could not get current score')
-        if current_score.get('game') and current_score.get('live_score_id') and current_score.get('youtube_video_id'):
-            logger.info('Found game %s - starting stream', current_score.get('live_score_id'))
+        if current_score.get('game') and current_score.get('wbsc_id'):
+            logger.info('Found game %s - generating overlay', current_score.get('wbsc_id'))
             try:
                 replay_mode = config.has_option('baseball', 'replay_mode') and config.get('baseball', 'replay_mode')
                 game = Game(current_score, mode=config.get('baseball', 'mode'), replay_mode=replay_mode)
