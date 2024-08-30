@@ -14,6 +14,12 @@ import sys
 import time
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+try:
+    import face_recognition
+    import numpy
+except:
+    face_recognition = None
+    numpy = None
 from io import BytesIO
 from docopt import docopt
 import configparser
@@ -38,13 +44,14 @@ LATEST_PLAY_URL = '%s/%%s/latest.json' % (BASE_URL)
 PLAY_URL = '%s/%%s/play%%s.json' % (BASE_URL)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36"}
 FIELD_IMAGE = 'https://static.wbsc.org/public/wbsc/images/baseball-field.svg'
+DEFAULT_IMAGE_URL = 'https://static.wbsc.org/assets/images/default-player.jpg'
 # STATS https://www.wbsc.org/api/v1/player/stats?tab=charts&fedId=143&eventId=2115&roundId=all&gameId=all&pId=649920&teamId=29254
 INPUT_CAMERA_STREAM_FIELD1 = config.has_option('baseball', 'input_stream_1') and config.get('baseball', 'input_stream_1')
 INPUT_CAMERA_STREAM_FIELD2 = config.has_option('baseball', 'input_stream_2') and config.get('baseball', 'input_stream_2')
 
 FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
 
-MAIN_STREAM = config.get('baseball', 'main_rtmp_stream')
+MAIN_STREAM = ''#config.get('baseball', 'main_rtmp_stream')
 BACKUP_STREAM = config.has_option('baseball', 'backup_rtmp_stream') and config.get('baseball', 'backup_rtmp_stream')
 
 LOGFILE = config.has_option('baseball', 'logfile') and config.get('baseball', 'logfile')
@@ -78,17 +85,50 @@ class Player:
         self.firstname = player_data.get('firstname')
         self.lastname = player_data.get('lastname')
         self.image_url = player_data.get('image')
-        self.image = Image.open(BytesIO(self.game.session.get(self.image_url).content))
-        width, height = self.image.size
-        self.image = self.image.resize((PHOTO_WIDTH, int(PHOTO_WIDTH * height / width)))
-        size = (PHOTO_WIDTH, PHOTO_WIDTH)
-        mask = Image.new('L', size, 0)
-        draw = ImageDraw.Draw(mask)
-        draw.ellipse((0, 0) + size, fill=255)
-        self.image = ImageOps.fit(self.image, mask.size, centering=(0.5, 0.5))
-        self.image.putalpha(mask)
+        if self.image_url == DEFAULT_IMAGE_URL:
+            self.image = None
+        else:
+            self.image = Image.open(BytesIO(self.game.session.get(self.image_url).content))
+            self.create_circle_mask()
         self.stats = player_data.get('SEASON')
         self.update(player_data, lineupcode)
+
+    def create_circle_mask(self):
+        width, height = self.image.size
+        self.image = self.image.resize((PHOTO_WIDTH, int(PHOTO_WIDTH * height / width)))
+        if self.image.mode != "RGB":
+            image = self.image.convert("RGB")
+        else:
+            image = self.image
+        if face_recognition:
+            image_np = numpy.array(image)
+            face_locations = face_recognition.face_locations(image_np)
+
+        width, height = self.image.size
+        if face_locations:
+            mask = Image.new("L", self.image.size, 0)
+            top, right, bottom, left = face_locations[0]
+            face_center_x = (left + right) // 2
+            face_center_y = (top + bottom) // 2
+            radius = min(face_center_x, width - face_center_x, face_center_y, height - face_center_y)
+            ellipse = ( face_center_x - radius, face_center_y - radius,
+                        face_center_x + radius, face_center_y + radius)
+            left = face_center_x - radius
+            upper = face_center_y - radius
+            right = face_center_x + radius
+            lower = face_center_y + radius
+        else:
+            logger.info('no face found for %s', self.name)
+            size = (PHOTO_WIDTH, PHOTO_WIDTH)
+            mask = Image.new('L', size, 0)
+            ellipse = (0, 0) + size
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse(ellipse, fill=255)
+        self.image = ImageOps.fit(self.image, mask.size, centering=(0.5, 0.5))
+        self.image.putalpha(mask)
+        if face_locations:
+            self.image = self.image.crop((left, upper, right, lower))
+            self.image = self.image.resize((PHOTO_WIDTH, PHOTO_WIDTH))
 
     def update(self, data, lineupcode):
         self.batting_order = lineupcode[2]
@@ -229,7 +269,8 @@ class Game:
         draw = ImageDraw.Draw(image)
         draw.polygon([(250, 100), (2500, 100), (2400, 250), (250, 250)], fill=main_color)
         draw.polygon([(250, 250), (2400, 250), (2300, 400), (250, 400)], fill=second_color)
-        draw.ellipse((0, 0) + (500, 500), fill=third_color)
+        if self.batter.image:
+            draw.ellipse((0, 0) + (500, 500), fill=third_color)
         font_name = ImageFont.truetype(FONTS,80)
         font_stat = ImageFont.truetype(FONTS,60)
         draw.text((550, 120), '%s. %s - %s' % (self.batter.batting_order, self.batter.name, self.batter.position), fill=text_main_color, font=font_name)
@@ -256,7 +297,8 @@ class Game:
         if config.has_option('baseball', 'test_time') and config.get('baseball', 'test_time'):
             player_label = str(datetime.now())
         draw.text((550, 270), player_label, fill=text_second_color, font=font_stat)
-        image.paste(self.batter.image, (15, 15), self.batter.image)
+        if self.batter.image:
+            image.paste(self.batter.image, (15, 15), self.batter.image)
         return image
 
     def get_lineup(self, team, filename):
