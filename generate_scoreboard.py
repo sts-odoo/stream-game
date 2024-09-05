@@ -441,14 +441,14 @@ class Game:
 
         elif self.current_play > 1:
             scorebug = self.get_scorebug()
-            ratio = self.resolution[0] / scorebug.size[0] / 4
+            ratio = self.resolution[0] / scorebug.size[0] / 6
             scorebug = scorebug.resize((int(scorebug.size[0] * ratio), int(scorebug.size[1] * ratio)))
-            image.paste(scorebug, (self.resolution[0] - scorebug.size[0] - 20, self.resolution[1] - scorebug.size[1] - 20), scorebug)
+            image.paste(scorebug, (20, self.resolution[1] - scorebug.size[1] - 20), scorebug)
 
             player = self.get_current_batter()
-            ratio = self.resolution[0] / player.size[0] / 1.75
+            ratio = self.resolution[0] / player.size[0] / 2
             player = player.resize((int(player.size[0] * ratio), int(player.size[1] * ratio)))
-            image.paste(player, (50, self.resolution[1] - player.size[1] - 50), player)
+            image.paste(player, (self.resolution[0] - player.size[0] - 30, self.resolution[1] - player.size[1] - 30), player)
         elif self.current_play <= 1:
             home_lineup = self.get_lineup(self.home, HOME_NAME)
             away_lineup = self.get_lineup(self.away, AWAY_NAME)
@@ -497,7 +497,7 @@ class Game:
             '-framerate', '3',
             '-loop', '1',
             '-i', os.path.join(WORKING_DIR, 'overlay.png'),
-            '-filter_complex', '[0:v][1:v]overlay[outv]',
+            '-filter_complex', '[0:v]scale=%s:%s[scaled];[scaled][1:v]overlay[outv]' % (INPUT_RESOLUTION[0], INPUT_RESOLUTION[1]),
             '-map', '[outv]',
             '-map', '0:a',
             '-c:a', 'aac',
