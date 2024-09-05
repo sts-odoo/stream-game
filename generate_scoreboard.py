@@ -52,6 +52,8 @@ DEFAULT_IMAGE_URL = 'https://static.wbsc.org/assets/images/default-player.jpg'
 # STATS https://www.wbsc.org/api/v1/player/stats?tab=charts&fedId=143&eventId=2115&roundId=all&gameId=all&pId=649920&teamId=29254
 INPUT_CAMERA_STREAM_FIELD1 = config.has_option('baseball', 'input_stream_1') and config.get('baseball', 'input_stream_1')
 INPUT_CAMERA_STREAM_FIELD2 = config.has_option('baseball', 'input_stream_2') and config.get('baseball', 'input_stream_2')
+FINE_TUNE_CAMERA_FIELD1 = 'rotate=0.06,crop=2320:1080:150:100,'
+FINE_TUNE_CAMERA_FIELD2 = ''
 
 FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
 
@@ -492,6 +494,7 @@ class Game:
             logger.info("Starting intro file.")
             self.start_video_file(config.get('baseball', 'intro_file'))
 
+        FINE_TUNE = FINE_TUNE_CAMERA_FIELD1 if self.game_info.get('camera') == 'camera1' else FINE_TUNE_CAMERA_FIELD2
         command = [
             'ffmpeg',
             '-re',
@@ -501,7 +504,7 @@ class Game:
             '-framerate', '3',
             '-loop', '1',
             '-i', os.path.join(WORKING_DIR, 'overlay.png'),
-            '-filter_complex', '[0:v]scale=%s:%s[scaled];[scaled][1:v]overlay[outv]' % (INPUT_RESOLUTION[0], INPUT_RESOLUTION[1]),
+            '-filter_complex', '[0:v]%sscale=%s:%s[scaled];[scaled][1:v]overlay[outv]' % (FINE_TUNE, INPUT_RESOLUTION[0], INPUT_RESOLUTION[1]),
             '-map', '[outv]',
             '-map', '0:a',
             '-c:a', 'aac',
@@ -514,7 +517,7 @@ class Game:
             '-g', '60',
             '-s', '1920x1080',
         ]
-        logger.info('FFMPEG Command: %s', ' '.join(command))
+        logger.info('FFMPEG Command: %s', ' '.join(command + [f'{MAIN_STREAM}']))
         self.stream_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
         if BACKUP_STREAM and not restart:
             self.backup_proc = subprocess.Popen(command + [f'{BACKUP_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
@@ -623,6 +626,7 @@ class Game:
 
     def cleanup(self):
         logger.info("Cleaning up...")
+        self.force_end = True
         if hasattr(self, 'stream_proc') and self.stream_proc and self.stream_proc.poll() is None:
             self.stream_proc.terminate()
             try:
