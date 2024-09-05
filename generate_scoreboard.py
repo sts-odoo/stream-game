@@ -12,7 +12,6 @@ import os
 import signal
 import sys
 import time
-import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 try:
     import face_recognition
@@ -24,8 +23,13 @@ from io import BytesIO
 from docopt import docopt
 import configparser
 from datetime import datetime
+import gevent
+from gevent import monkey
 
 import logging
+
+monkey.patch_all()
+import requests
 
 ARGS = docopt(__doc__)
 
@@ -204,6 +208,7 @@ class Game:
         self.replay_mode = replay_mode
         self.stream_proc = None
         self.game_started = False
+        self.force_end = False
         self.game_info = game_info
         self.logfile = open(LOGFILE, 'a') if LOGFILE else None
         self.initialize_stream()
@@ -514,25 +519,53 @@ class Game:
         if BACKUP_STREAM and not restart:
             self.backup_proc = subprocess.Popen(command + [f'{BACKUP_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
 
-    def check_stream(self):
-        if self.stream_proc:
-             retcode = self.stream_proc.poll()
-             if retcode:
-                logger.info('FFmpeg failed for an unknown reason (return code %s), restarting', retcode)
-                self.initialize_stream(restart=True)
+    def loop_check_stream(self):
+        while True:
+            if self.force_end:
+                break
+            if self.stream_proc:
+                 retcode = self.stream_proc.poll()
+                 if retcode:
+                    logger.info('FFmpeg failed for an unknown reason (return code %s), restarting', retcode)
+                    self.initialize_stream(restart=True)
+            time.sleep(1)
 
-    def run(self):
+    def loop_check_main_website(self):
+        error = 0
+        while True:
+            if self.force_end:
+                break
+            time.sleep(15)
+            try:
+                current_score = requests.get(f'{WEBSITE_URL}/game/current_score', timeout=30)
+                current_score.raise_for_status()
+                current_score = current_score.json()
+                logger.info('Got current score %s', current_score)
+            except requests.HTTPError:
+                logger.exception('Could not get current score')
+                continue
+            if not current_score.get('game'):
+                error += 1
+                logger.info('No game detected on the website')
+                if error >= 3:
+                    logger.info('Force stoppping game')
+                    self.force_end = True
+            else:
+                error = 0
+
+    def loop_main(self):
         start = int(time.time() * 1000)
         self.make_overlay()
         time.sleep(10)
         end_time = None
         while True:
+            if self.force_end:
+                break
             if not self.game_started:
                 self.init_game()
                 logger.info('Game has not started yet, waiting 30s then retrying')
                 time.sleep(30)
                 continue
-            self.check_stream()
             logger.info('Play %s', self.current_play)
             if self.inning == 'F':
                 if self.mode == 'replay':
@@ -590,14 +623,14 @@ class Game:
 
     def cleanup(self):
         logger.info("Cleaning up...")
-        if hasattr(self, 'stream_proc') and self.stream_proc.poll() is None:
+        if hasattr(self, 'stream_proc') and self.stream_proc and self.stream_proc.poll() is None:
             self.stream_proc.terminate()
             try:
                 self.stream_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.stream_proc.kill()
             logger.info("FFmpeg process terminated.")
-        if hasattr(self, 'backup_proc') and self.backup_proc.poll() is None:
+        if hasattr(self, 'backup_proc') and self.backup_proc and self.backup_proc.poll() is None:
             self.backup_proc.terminate()
             try:
                 self.backup_proc.wait(timeout=5)
@@ -632,7 +665,10 @@ def main():
                     os._exit(0)
                 signal.signal(signal.SIGINT, signal_handler)
                 signal.signal(signal.SIGTERM, signal_handler)
-                game.run()
+                greenlet_loop_main = gevent.spawn(game.loop_main)
+                greenlet_loop_check_stream = gevent.spawn(game.loop_check_stream)
+                greenlet_loop_check_main_website = gevent.spawn(game.loop_check_main_website)
+                gevent.joinall([greenlet_loop_main, greenlet_loop_check_stream, greenlet_loop_check_main_website])
             except Exception:
                 logger.exception('Failed to start game, retrying in 60s')
                 time.sleep(60)
