@@ -628,18 +628,10 @@ class Game:
         logger.info("Cleaning up...")
         self.force_end = True
         if hasattr(self, 'stream_proc') and self.stream_proc and self.stream_proc.poll() is None:
-            self.stream_proc.terminate()
-            try:
-                self.stream_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.stream_proc.kill()
+            self.stream_proc.kill()
             logger.info("FFmpeg process terminated.")
         if hasattr(self, 'backup_proc') and self.backup_proc and self.backup_proc.poll() is None:
-            self.backup_proc.terminate()
-            try:
-                self.backup_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.backup_proc.kill()
+            self.backup_proc.kill()
             logger.info("Backup FFmpeg process terminated.")
         if self.logfile:
             self.logfile.close()
