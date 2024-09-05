@@ -569,11 +569,11 @@ class Game:
             logger.info('Play %s', self.current_play)
             if self.inning == 'F':
                 if self.mode == 'replay':
-                    break
+                    self.force_end = True
                 if not end_time:
                     end_time = time.time()
                 elif time.time() - end_time > 120:
-                    break
+                    self.force_end = True
             else:
                 end_time = None
             if self.mode == 'replay' and self.replay_mode == 'realtime':
