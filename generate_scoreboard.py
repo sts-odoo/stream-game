@@ -514,7 +514,7 @@ class Game:
             '-g', '60',
             '-s', '1920x1080',
         ]
-
+        logger.info('FFMPEG Command: %s', ' '.join(command))
         self.stream_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
         if BACKUP_STREAM and not restart:
             self.backup_proc = subprocess.Popen(command + [f'{BACKUP_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
