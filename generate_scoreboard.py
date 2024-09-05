@@ -170,11 +170,15 @@ class Team:
             for lineupcode in players
             if players[lineupcode]['teamid'] == id and lineupcode[2] != '0'
         }
-        player, lineupcode = [(p, lineupcode) for lineupcode, p in players.items() if (p.get('POS') == 'P' or p.get('PITCHIP'))][0]
-        self.pitcher = Player(self.game, self, player, lineupcode)
+        self.all_players = {playerid: player for playerid, player in self.lineup.items()}
+        player, lineupcode = [(p, lineupcode)
+            for lineupcode, p in players.items()
+            if (p.get('POS') == 'P' or p.get('PITCHIP')) and players[lineupcode]['teamid'] == id][0]
+        self.pitcher = self.get_player(player, lineupcode)
         self.primary_color = primary_color
         self.secondary_color = secondary_color
         self.image = False
+        self.all_players[self.pitcher.id] = self.pitcher
         if logo_url:
             self.image = Image.open(BytesIO(self.game.session.get(logo_url).content))
 
@@ -186,13 +190,22 @@ class Team:
                 if player.get('playerid') in self.lineup:
                     self.lineup[player['playerid']].update(player, lineupcode)
                 else:
-                    self.lineup[player['playerid']] = Player(self.game, self, player, lineupcode)
+                    self.lineup[player['playerid']] = self.get_player(player, lineupcode)
             elif player.get('POS') == 'P' or player.get('PITCHIP'):
                 # TODO: multiple pitchers?
                 if player.get('playerid') == self.pitcher.id:
                     self.pitcher.update(player, lineupcode)
                 else:
-                    self.pitcher = Player(self.game, self, player, lineupcode)
+                    self.pitcher = self.get_player(player, lineupcode)
+
+    def get_player(self, player, lineupcode):
+        if self.all_players.get(player['playerid']):
+            self.all_players[player['playerid']].update(player, lineupcode)
+            return self.all_players[player['playerid']]
+        else:
+            new_player = Player(self.game, self, player, lineupcode)
+            self.all_players[new_player.id] = new_player
+            return new_player
 
     def get_lineup(self):
         lineup = sorted([player for x, player in self.lineup.items()], key= lambda p: p.batting_order)
@@ -278,6 +291,9 @@ class Game:
         draw.polygon([(250, 250), (2400, 250), (2300, 400), (250, 400)], fill=second_color)
         if self.batter.image:
             draw.ellipse((0, 0) + (500, 500), fill=third_color)
+        else:
+            draw.pieslice([100, 100, 400, 400], start=180, end=270, fill=main_color)
+            draw.pieslice([100, 100, 400, 400], start=90, end=180, fill=second_color)
         font_name = ImageFont.truetype(FONTS,80)
         font_stat = ImageFont.truetype(FONTS,60)
         draw.text((550, 120), '%s. %s - %s' % (self.batter.batting_order, self.batter.name, self.batter.position), fill=text_main_color, font=font_name)
@@ -347,7 +363,6 @@ class Game:
             draw.text((50, position), player_name, fill=text_color, font=font_player)
             draw.text((400, position), player.position, fill=text_color, font=font_name)
             position += space + height
-
         width, height = team.image.size
         team_image = team.image.resize((int((logo_height - 3 * space) * width / height), (logo_height - 3 * space)))
         try:
@@ -433,15 +448,15 @@ class Game:
     def make_overlay(self):
         image = Image.new('RGBA', self.resolution)
         if not self.game_started:
-            for team_logo in [('away_logo', 3.00), ('home_logo', 1.00)]:
+            for team_logo in [('away_logo', 3.70), ('home_logo', 0.30)]:
                 try:
                     logo = Image.open(BytesIO(requests.get(self.game_info.get(team_logo[0])).content))
                     width, height = logo.size
                     logo = logo.resize((int(self.resolution[0] / 5.00), int((self.resolution[0] / 5.00) * height / width)))
                     try:
-                        image.paste(logo, (int(team_logo[1] * self.resolution[0] / 5.00), int(self.resolution[1] / 3.00)), logo)
+                        image.paste(logo, (int(team_logo[1] * self.resolution[0] / 5.00), int(self.resolution[1] / 1.50)), logo)
                     except:
-                        image.paste(logo, (int(team_logo[1] * self.resolution[0] / 5.00), int(self.resolution[1] / 3.00)))
+                        image.paste(logo, (int(team_logo[1] * self.resolution[0] / 5.00), int(self.resolution[1] / 1.50)))
                 except:
                     logger.error('Could not generate team initial logo')
 
@@ -450,11 +465,11 @@ class Game:
             ratio = self.resolution[0] / scorebug.size[0] / 6
             scorebug = scorebug.resize((int(scorebug.size[0] * ratio), int(scorebug.size[1] * ratio)))
             image.paste(scorebug, (20, self.resolution[1] - scorebug.size[1] - 20), scorebug)
-
-            player = self.get_current_batter()
-            ratio = self.resolution[0] / player.size[0] / 2
-            player = player.resize((int(player.size[0] * ratio), int(player.size[1] * ratio)))
-            image.paste(player, (self.resolution[0] - player.size[0] - 30, self.resolution[1] - player.size[1] - 30), player)
+            if self.inning != 'F':
+                player = self.get_current_batter()
+                ratio = self.resolution[0] / player.size[0] / 2
+                player = player.resize((int(player.size[0] * ratio), int(player.size[1] * ratio)))
+                image.paste(player, (self.resolution[0] - player.size[0] - 30, self.resolution[1] - player.size[1] - 30), player)
         elif self.current_play <= 1:
             home_lineup = self.get_lineup(self.home, HOME_NAME)
             away_lineup = self.get_lineup(self.away, AWAY_NAME)
