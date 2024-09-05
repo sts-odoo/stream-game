@@ -55,7 +55,7 @@ INPUT_CAMERA_STREAM_FIELD2 = config.has_option('baseball', 'input_stream_2') and
 
 FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
 
-MAIN_STREAM = ''#config.get('baseball', 'main_rtmp_stream')
+MAIN_STREAM = config.get('baseball', 'main_rtmp_stream')
 BACKUP_STREAM = config.has_option('baseball', 'backup_rtmp_stream') and config.get('baseball', 'backup_rtmp_stream')
 
 LOGFILE = config.has_option('baseball', 'logfile') and config.get('baseball', 'logfile')
