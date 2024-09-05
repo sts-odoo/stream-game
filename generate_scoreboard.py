@@ -355,7 +355,6 @@ class Game:
 
         bg_color = (0, 0, 0, 180)
         text_color = (255, 255, 255, 200)
-        out_color = (255, 255, 255, 100)
         border_base_color = (255, 255, 255, 170)
         base_runner_color = (255, 255, 128, 255)
         image = Image.new('RGBA', (1000, 750))
@@ -418,7 +417,7 @@ class Game:
         draw.polygon([(70, 675), (70 + 40, 675), (70 + 20, 675 + (-40 if self.inning_top else 40)),], fill=border_base_color)
         draw.text((70 + 15 + 40, 600), self.inning, fill=text_color, font=font_team)
         draw.text((330, 600), str(self.outs), fill=text_color, font=font_team)
-        draw.text((410, 600), 'out', fill=out_color, font=font_out)
+        draw.text((410, 600), 'out', fill=text_color, font=font_out)
         count = '%s-%s' % (self.balls, self.strikes)
         count_length = draw.textlength(count, font_team)
         draw.text((l1 + offset_x - count_length / 2, 600), count, fill=text_color, font=font_team)
