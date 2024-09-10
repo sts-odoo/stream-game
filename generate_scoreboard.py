@@ -52,7 +52,7 @@ DEFAULT_IMAGE_URL = 'https://static.wbsc.org/assets/images/default-player.jpg'
 # STATS https://www.wbsc.org/api/v1/player/stats?tab=charts&fedId=143&eventId=2115&roundId=all&gameId=all&pId=649920&teamId=29254
 INPUT_CAMERA_STREAM_FIELD1 = config.has_option('baseball', 'input_stream_1') and config.get('baseball', 'input_stream_1')
 INPUT_CAMERA_STREAM_FIELD2 = config.has_option('baseball', 'input_stream_2') and config.get('baseball', 'input_stream_2')
-FINE_TUNE_CAMERA_FIELD1 = 'rotate=0.06,crop=2320:1080:150:100,'
+FINE_TUNE_CAMERA_FIELD1 = 'rotate=0.06,crop=2100:980:100:100,'
 FINE_TUNE_CAMERA_FIELD2 = ''
 
 FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
@@ -61,7 +61,7 @@ MAIN_STREAM = config.get('baseball', 'main_rtmp_stream')
 BACKUP_STREAM = config.has_option('baseball', 'backup_rtmp_stream') and config.get('baseball', 'backup_rtmp_stream')
 
 LOGFILE = config.has_option('baseball', 'logfile') and config.get('baseball', 'logfile')
-INPUT_RESOLUTION = (2560, 1440)
+INPUT_RESOLUTION = (1920, 1080)
 
 PHOTO_WIDTH = 470
 
@@ -526,11 +526,12 @@ class Game:
             '-b:a', '128k',
             '-strict', 'experimental',
             '-f', 'flv',
-            '-b:v', '8000k',
+            '-b:v', '3000k',
             '-vcodec', 'h264',
             '-preset', 'ultrafast',
             '-g', '60',
             '-s', '1920x1080',
+            '-rtbufsize', '1G',
         ]
         logger.info('FFMPEG Command: %s', ' '.join(command + [f'{MAIN_STREAM}']))
         self.stream_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
