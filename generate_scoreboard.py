@@ -533,7 +533,7 @@ class Game:
             '-err_detect', 'ignore_err',
             '-fps_mode', 'vfr',
             '-max_muxing_queue_size', '1024',
-            '-rtbufsize', '1G'
+            '-rtbufsize', '1G',
             '-f', 'flv',
             '-b:v', '3000k',
             '-vcodec', 'h264',
