@@ -10,6 +10,7 @@ Options:
 import subprocess
 import os
 import signal
+import shutil
 import sys
 import time
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -52,7 +53,7 @@ DEFAULT_IMAGE_URL = 'https://static.wbsc.org/assets/images/default-player.jpg'
 # STATS https://www.wbsc.org/api/v1/player/stats?tab=charts&fedId=143&eventId=2115&roundId=all&gameId=all&pId=649920&teamId=29254
 INPUT_CAMERA_STREAM_FIELD1 = config.has_option('baseball', 'input_stream_1') and config.get('baseball', 'input_stream_1')
 INPUT_CAMERA_STREAM_FIELD2 = config.has_option('baseball', 'input_stream_2') and config.get('baseball', 'input_stream_2')
-FINE_TUNE_CAMERA_FIELD1 = 'rotate=0.06,crop=2100:980:100:100,'
+FINE_TUNE_CAMERA_FIELD1 = 'rotate=0.06,crop=584:363:91:76,'
 FINE_TUNE_CAMERA_FIELD2 = ''
 
 FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
@@ -519,20 +520,13 @@ class Game:
             '-f', 'image2',
             '-framerate', '3',
             '-loop', '1',
-            '-thread_queue_size', '512',
             '-i', os.path.join(WORKING_DIR, 'overlay.png'),
             '-filter_complex', '[0:v]%sscale=%s:%s[scaled];[scaled][1:v]overlay[outv]' % (FINE_TUNE, INPUT_RESOLUTION[0], INPUT_RESOLUTION[1]),
             '-map', '[outv]',
             '-map', '0:a',
-            '-ac', '2',
-            '-ar', '44100',
             '-c:a', 'aac',
             '-b:a', '96k',
             '-strict', 'experimental',
-            '-fflags', '+genpts',
-            '-err_detect', 'ignore_err',
-            '-fps_mode', 'vfr',
-            '-max_muxing_queue_size', '1024',
             '-rtbufsize', '1G',
             '-f', 'flv',
             '-b:v', '3000k',
@@ -659,6 +653,8 @@ class Game:
             logger.info("Backup FFmpeg process terminated.")
         if self.logfile:
             self.logfile.close()
+        if os.path.exists(os.path.join(WORKING_DIR, 'default.png')):
+            shutil.copyfile(os.path.join(WORKING_DIR, 'default.png'), os.path.join(WORKING_DIR, 'overlay.png'))
 
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename=LOGFILE, filemode='a')
