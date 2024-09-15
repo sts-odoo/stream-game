@@ -53,7 +53,8 @@ DEFAULT_IMAGE_URL = 'https://static.wbsc.org/assets/images/default-player.jpg'
 # STATS https://www.wbsc.org/api/v1/player/stats?tab=charts&fedId=143&eventId=2115&roundId=all&gameId=all&pId=649920&teamId=29254
 INPUT_CAMERA_STREAM_FIELD1 = config.has_option('baseball', 'input_stream_1') and config.get('baseball', 'input_stream_1')
 INPUT_CAMERA_STREAM_FIELD2 = config.has_option('baseball', 'input_stream_2') and config.get('baseball', 'input_stream_2')
-FINE_TUNE_CAMERA_FIELD1 = 'rotate=0.06,crop=584:363:91:76,'
+FINE_TUNE_CAMERA_FIELD1 = 'rotate=0.06,crop=2100:980:100:100,'
+
 FINE_TUNE_CAMERA_FIELD2 = ''
 
 FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
