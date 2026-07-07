@@ -42,6 +42,10 @@ config.read(ARGS['<config_file>'])
 WEBSITE_URL = config.get('baseball', 'website_url')
 WORKING_DIR = config.get('baseball', 'working_dir')
 TIMEOUT = 30
+# watchdog: restart ffmpeg if it makes no output progress for that many seconds
+STREAM_STALL_TIMEOUT = 30
+# watchdog: leave ffmpeg time to connect to the RTMP server after a (re)start
+STREAM_STARTUP_GRACE = 60
 HOME_NAME = 'home'
 AWAY_NAME = 'away'
 BASE_URL = 'https://game.wbsc.org/gamedata'
@@ -226,6 +230,11 @@ class Game:
         self.stream_proc = None
         self.game_started = False
         self.force_end = False
+        self.stream_restart_count = None
+        self.progress_file = os.path.join(WORKING_DIR, 'ffmpeg-progress.log')
+        self.last_progress = -1
+        self.last_progress_time = time.time()
+        self.stream_started_at = time.time()
         self.game_info = game_info
         self.logfile = open(LOGFILE, 'a') if LOGFILE else None
         self.initialize_stream()
@@ -536,20 +545,64 @@ class Game:
             '-g', '60',
             '-s', '1920x1080',
         ]
-        logger.info('FFMPEG Command: %s', ' '.join(command + [f'{MAIN_STREAM}']))
-        self.stream_proc = subprocess.Popen(command + [f'{MAIN_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
+        # watchdog: ffmpeg appends its encoding progress (frame=/out_time=) to this
+        # file every ~500ms; if the file stops growing, the output is stalled
+        # (typically a frozen RTMP socket after a connection loss), see loop_check_stream
+        try:
+            os.remove(self.progress_file)
+        except OSError:
+            pass
+        self.last_progress = -1
+        self.last_progress_time = time.time()
+        self.stream_started_at = time.time()
+        main_command = command + ['-progress', self.progress_file, f'{MAIN_STREAM}']
+        logger.info('FFMPEG Command: %s', ' '.join(main_command))
+        self.stream_proc = subprocess.Popen(main_command, stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
         if BACKUP_STREAM and not restart:
             self.backup_proc = subprocess.Popen(command + [f'{BACKUP_STREAM}'], stdin=subprocess.PIPE, stderr=self.logfile or subprocess.STDOUT, universal_newlines=True)
+
+    def restart_stream(self):
+        """Kill the current ffmpeg process and start a new one.
+
+        Triggered by:
+        - the local watchdog (loop_check_stream) when ffmpeg exited or is
+          frozen (no output progress), e.g. after a connection loss;
+        - the server (odoo) through the `stream_restart_count` value of
+          /game/current_score when the YouTube API reports that the bound
+          live stream is no longer receiving data.
+        """
+        # detach the proc first so loop_check_stream does not also restart it
+        proc, self.stream_proc = self.stream_proc, None
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        self.initialize_stream(restart=True)
 
     def loop_check_stream(self):
         while True:
             if self.force_end:
                 break
             if self.stream_proc:
-                 retcode = self.stream_proc.poll()
-                 if retcode:
-                    logger.info('FFmpeg failed for an unknown reason (return code %s), restarting', retcode)
-                    self.initialize_stream(restart=True)
+                retcode = self.stream_proc.poll()
+                if retcode is not None:
+                    # also restart on exit code 0: a "clean" exit in the middle of
+                    # a game usually means the RTMP server closed the connection
+                    logger.info('FFmpeg exited (return code %s), restarting', retcode)
+                    self.restart_stream()
+                elif time.time() - self.stream_started_at > STREAM_STARTUP_GRACE:
+                    # watchdog: after a connection loss ffmpeg often survives in a
+                    # frozen state (TCP retransmits silently, rtbufsize absorbs)
+                    # without ever exiting; detect it via the progress file
+                    try:
+                        progress = os.path.getsize(self.progress_file)
+                    except OSError:
+                        progress = -1
+                    if progress != self.last_progress:
+                        self.last_progress = progress
+                        self.last_progress_time = time.time()
+                    elif time.time() - self.last_progress_time > STREAM_STALL_TIMEOUT:
+                        logger.info('FFmpeg is stalled (no progress for %ss), restarting', STREAM_STALL_TIMEOUT)
+                        self.restart_stream()
             time.sleep(1)
 
     def loop_check_main_website(self):
@@ -563,7 +616,9 @@ class Game:
                 current_score.raise_for_status()
                 current_score = current_score.json()
                 logger.info('Got current score %s', current_score)
-            except requests.HTTPError:
+            except (requests.RequestException, ValueError):
+                # connection loss included: keep the loop alive, ffmpeg will
+                # reconnect by itself or be restarted by the server on recovery
                 logger.exception('Could not get current score')
                 continue
             if not current_score.get('game'):
@@ -574,6 +629,13 @@ class Game:
                     self.force_end = True
             else:
                 error = 0
+                restart_count = current_score.get('stream_restart_count') or 0
+                if self.stream_restart_count is None:
+                    self.stream_restart_count = restart_count
+                elif restart_count != self.stream_restart_count:
+                    self.stream_restart_count = restart_count
+                    logger.info('Stream restart requested by the server (count %s)', restart_count)
+                    self.restart_stream()
 
     def loop_main(self):
         start = int(time.time() * 1000)
@@ -666,8 +728,9 @@ def main():
             current_score.raise_for_status()
             current_score = current_score.json()
             logger.info('Got current score %s', current_score)
-        except requests.HTTPError:
+        except (requests.RequestException, ValueError):
             logger.exception('Could not get current score')
+            current_score = {}
         if current_score.get('game') and current_score.get('live_score_id') and current_score.get('youtube_video_id'):
             logger.info('Found game %s - starting stream', current_score.get('live_score_id'))
             try:
