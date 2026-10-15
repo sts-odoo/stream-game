@@ -1,4 +1,6 @@
-face_recgnition
+cairosvg
+docopt
+face_recognition
 gevent
 pillow
 requests

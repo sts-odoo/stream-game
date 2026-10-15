@@ -13,7 +13,11 @@ import signal
 import shutil
 import sys
 import time
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+import math
+import base64
+from xml.sax.saxutils import escape as xml_escape
+import cairosvg
+from PIL import Image, ImageDraw, ImageOps
 try:
     import face_recognition
     import numpy
@@ -61,8 +65,6 @@ FINE_TUNE_CAMERA_FIELD1 = 'rotate=0.06,crop=2100:980:100:100,'
 
 FINE_TUNE_CAMERA_FIELD2 = ''
 
-FONTS = '/usr/share/fonts/X11/Type1/NimbusSans-Regular.pfb'
-
 MAIN_STREAM = config.get('baseball', 'main_rtmp_stream')
 BACKUP_STREAM = config.has_option('baseball', 'backup_rtmp_stream') and config.get('baseball', 'backup_rtmp_stream')
 
@@ -70,6 +72,191 @@ LOGFILE = config.has_option('baseball', 'logfile') and config.get('baseball', 'l
 INPUT_RESOLUTION = (1920, 1080)
 
 PHOTO_WIDTH = 470
+
+# Scorebug layout (see Game.get_scorebug): a two-row left column (team logo +
+# that team's own color as the score cell background, with the text color
+# picked automatically for contrast), a shared dark panel on the right
+# (inning, bases diamond, outs, count), and a pitcher-name strip below.
+#
+# make_overlay() resizes the rasterized card to resolution[0] /
+# SCOREBUG_DISPLAY_SCALE wide on the final video frame (e.g. ~384px on a
+# 1920-wide stream) -- that happens after rasterization, so it doesn't affect
+# any of the geometry below.
+SCOREBUG_LOGO_COL_W = 90
+SCOREBUG_SCORE_COL_W = 170
+SCOREBUG_RIGHT_W = 250
+SCOREBUG_ROW_H = 85
+SCOREBUG_PITCHER_ROW_H = 54
+SCOREBUG_RADIUS = 16
+SCOREBUG_ACCENT = (22, 35, 63)  # neutral navy for the shared bases/inning panel -- not either team's color
+SCOREBUG_DIAMOND_RADIUS = 16
+SCOREBUG_DIAMOND_GAP = 8  # gap between the 3 base markers, beyond just touching
+SCOREBUG_BASE_MARKER_RADIUS = 7  # also used for the outs dots
+SCOREBUG_DISPLAY_SCALE = 5
+CARD_BORDER_COLOR = '#e2e2e5'  # the one light-gray border/divider color used on every card
+FONT_FAMILY = 'Nimbus Sans'
+FONT_SIZE_SCOREBUG_CODE = 28
+FONT_SIZE_SCOREBUG_SCORE = 46
+FONT_SIZE_SCOREBUG_INNING = 36
+FONT_SIZE_SCOREBUG_COUNT = 36
+FONT_SIZE_SCOREBUG_PITCHER = 24
+FONT_SIZE_SCOREBUG_PITCH_COUNT = 20
+
+
+def _svg_hex(rgb):
+    return '#%02x%02x%02x' % tuple(rgb[:3])
+
+
+def _svg_diamond_points(cx, cy, r):
+    """SVG polygon `points` string for a diamond (square rotated 45°) of
+    half-diagonal `r`, centered on (cx, cy)."""
+    return '%.1f,%.1f %.1f,%.1f %.1f,%.1f %.1f,%.1f' % (cx, cy - r, cx + r, cy, cx, cy + r, cx - r, cy)
+
+
+def _image_data_uri(image):
+    buf = BytesIO()
+    image.convert('RGBA').save(buf, format='PNG')
+    return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+
+
+def _svg_logo_tag(image, box_x, box_y, box_w, box_h, pad=0.14):
+    """<image> tag that fits `image` *inside* the given box (letterboxed, not
+    cropped) -- team logos are rarely perfectly square. Returns '' if there's
+    no logo, rather than erroring."""
+    if not image:
+        return ''
+    nat_w, nat_h = image.size
+    avail_w, avail_h = box_w * (1 - pad), box_h * (1 - pad)
+    scale = min(avail_w / nat_w, avail_h / nat_h)
+    w, h = nat_w * scale, nat_h * scale
+    x = box_x + (box_w - w) / 2
+    y = box_y + (box_h - h) / 2
+    return '<image href="%s" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (_image_data_uri(image), x, y, w, h)
+
+
+def _svg_text(x, y, text, size, fill, anchor='start', opacity=None, family=FONT_FAMILY, bold=True, max_width=None):
+    """<text> element, always escaped -- routing every scorebug/batter text
+    element through here means a dynamic value (team code, pitcher surname)
+    can't end up unescaped in the markup just because a future edit forgot
+    the usual xml_escape() call.
+
+    `max_width`, if given, sets textLength/lengthAdjust so the renderer
+    itself compresses the glyphs to fit -- a guaranteed exact width, unlike
+    estimating a font size from character count."""
+    weight = 'bold' if bold else 'normal'
+    attrs = 'font-family="%s" font-weight="%s" font-size="%d" fill="%s"' % (family, weight, size, fill)
+    if opacity is not None:
+        attrs += ' fill-opacity="%s"' % opacity
+    if anchor != 'start':
+        attrs += ' text-anchor="%s"' % anchor
+    if max_width is not None:
+        attrs += ' textLength="%s" lengthAdjust="spacingAndGlyphs"' % max_width
+    return '<text x="%s" y="%s" %s>%s</text>' % (x, y, attrs, xml_escape(str(text)))
+
+
+def _svg_rect(x, y, w, h, fill, rx=None):
+    rx_attr = f' rx="{rx}"' if rx is not None else ''
+    return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"{rx_attr}/>'
+
+
+def _svg_line(x1, y1, x2, y2, stroke=CARD_BORDER_COLOR, width=3):
+    return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{stroke}" stroke-width="{width}"/>'
+
+
+def _svg_slanted_bar_points(left, right, top, bottom, slant):
+    """SVG polygon `points` for the same parallelogram shape as the PIL
+    _slanted_bar() helper: spans [left, right] x [top, bottom], right edge
+    shifted left by `slant` at the bottom."""
+    return f'{left},{top} {right},{top} {right - slant},{bottom} {left},{bottom}'
+
+
+def _svg_pie_slice(cx, cy, r, start_deg, end_deg):
+    """SVG path for a pie wedge from start_deg to end_deg, using PIL's
+    pieslice() angle convention (0=east/+x, clockwise in image coordinates,
+    i.e. the same direction as SVG's sweep-flag=1 in a y-down system)."""
+    start_rad, end_rad = math.radians(start_deg), math.radians(end_deg)
+    x1, y1 = cx + r * math.cos(start_rad), cy + r * math.sin(start_rad)
+    x2, y2 = cx + r * math.cos(end_rad), cy + r * math.sin(end_rad)
+    large_arc = 1 if (end_deg - start_deg) % 360 > 180 else 0
+    return f'M {cx},{cy} L {x1:.1f},{y1:.1f} A {r},{r} 0 {large_arc},1 {x2:.1f},{y2:.1f} Z'
+
+
+def _svg_arc(cx, cy, r, start_deg, end_deg):
+    """Like _svg_pie_slice, but just the curved edge itself (no radii lines
+    to the center, not closed) -- for stroking an arc, e.g. a border running
+    around the outside of a pie-slice badge."""
+    start_rad, end_rad = math.radians(start_deg), math.radians(end_deg)
+    x1, y1 = cx + r * math.cos(start_rad), cy + r * math.sin(start_rad)
+    x2, y2 = cx + r * math.cos(end_rad), cy + r * math.sin(end_rad)
+    large_arc = 1 if (end_deg - start_deg) % 360 > 180 else 0
+    return f'M {x1:.1f},{y1:.1f} A {r},{r} 0 {large_arc},1 {x2:.1f},{y2:.1f}'
+
+
+def _svg_corner_cut(corner, towards_pt, r):
+    """Point `r` units from `corner`, along the segment toward `towards_pt`
+    (clamped to at most half that segment). Used to cut back a polygon edge
+    before rounding the corner with a quadratic curve through the original
+    vertex."""
+    cx, cy = corner
+    dx, dy = towards_pt[0] - cx, towards_pt[1] - cy
+    length = math.hypot(dx, dy) or 1
+    r = min(r, length / 2)
+    return (cx + dx / length * r, cy + dy / length * r)
+
+
+def _svg_rounded_quad_path(p1, p2, p3, p4, r1=0, r2=0, r3=0, r4=0):
+    """Closed SVG path for the quadrilateral p1->p2->p3->p4 (a rectangle or,
+    for the slanted bars/rows, a parallelogram), rounding each corner by its
+    own radius (0 = sharp) -- so just the corners that double as the card's
+    outer silhouette can be softened, like the scorebug's card border,
+    without touching the ones shared with an internal divider or hidden
+    behind the photo."""
+    points = [p1, p2, p3, p4]
+    radii = [r1, r2, r3, r4]
+    d = []
+    for i in range(4):
+        prev_pt, corner, next_pt = points[i - 1], points[i], points[(i + 1) % 4]
+        r = radii[i]
+        start = _svg_corner_cut(corner, prev_pt, r) if r else corner
+        end = _svg_corner_cut(corner, next_pt, r) if r else corner
+        d.append(('M %.1f,%.1f' if i == 0 else 'L %.1f,%.1f') % start)
+        if r:
+            d.append('Q %.1f,%.1f %.1f,%.1f' % (corner[0], corner[1], end[0], end[1]))
+    d.append('Z')
+    return ' '.join(d)
+
+
+# Current-batter card layout (see Game.get_current_batter): two slanted bars
+# plus a circular photo/placeholder badge.
+BATTER_CARD_SIZE = (2500, 500)
+BATTER_PORTRAIT_SIZE = 500  # diameter of the circular photo area, left-aligned
+BATTER_PORTRAIT_PADDING = 15
+BATTER_PORTRAIT_PLACEHOLDER_RADIUS = 150  # pie-slice badge shown when there is no photo
+BATTER_BAR_LEFT = BATTER_PORTRAIT_SIZE // 2  # the two bars start at the portrait's center
+BATTER_BAR_HEIGHT = 150
+BATTER_BAR_SLANT = 100
+BATTER_NAME_BAR_TOP = 100
+BATTER_TEXT_LEFT = 550
+BATTER_TEXT_PADDING_TOP = 20
+BATTER_CORNER_RADIUS = 50  # softens the card's two true outer corners, like SCOREBUG_RADIUS
+FONT_SIZE_BATTER_NAME = 80
+FONT_SIZE_BATTER_STAT = 60
+
+# Lineup card layout (see Game.get_lineup).
+LINEUP_CARD_WIDTH = 500
+LINEUP_HEADER_HEIGHT = 100
+LINEUP_ROW_HEIGHT = 50
+LINEUP_ROW_SLANT = 50
+LINEUP_PADDING = 10
+LINEUP_MAX_ROWS = 10  # 9 lineup spots + 1 pitcher
+LINEUP_BATTING_ORDER_X = 10
+LINEUP_NAME_X = 50
+LINEUP_NAME_MAX_WIDTH = 350
+LINEUP_POSITION_X = 400
+LINEUP_CORNER_RADIUS = SCOREBUG_RADIUS  # this card is a similar size -- an actual shared value, not a coincidence
+FONT_SIZE_LINEUP_HEADER = 60
+FONT_SIZE_LINEUP_LABEL = 30
+
 
 def hex2rgb(hex_color):
     if not hex_color:
@@ -100,7 +287,7 @@ class Player:
         if self.image_url == DEFAULT_IMAGE_URL:
             self.image = None
         else:
-            self.image = Image.open(BytesIO(self.game.session.get(self.image_url).content))
+            self.image = Image.open(BytesIO(self.game.session.get(self.image_url, timeout=TIMEOUT).content))
             self.create_circle_mask()
         self.stats = player_data.get('SEASON')
         self.update(player_data, lineupcode)
@@ -112,6 +299,7 @@ class Player:
             image = self.image.convert("RGB")
         else:
             image = self.image
+        face_locations = None
         if face_recognition:
             image_np = numpy.array(image)
             face_locations = face_recognition.face_locations(image_np)
@@ -177,16 +365,21 @@ class Team:
             if players[lineupcode]['teamid'] == id and lineupcode[2] != '0'
         }
         self.all_players = {playerid: player for playerid, player in self.lineup.items()}
-        player, lineupcode = [(p, lineupcode)
+        pitcher_candidates = [(p, lineupcode)
             for lineupcode, p in players.items()
-            if (p.get('POS') == 'P' or p.get('PITCHIP')) and players[lineupcode]['teamid'] == id][0]
-        self.pitcher = self.get_player(player, lineupcode)
+            if (p.get('POS') == 'P' or p.get('PITCHIP')) and players[lineupcode]['teamid'] == id]
+        if pitcher_candidates:
+            player, lineupcode = pitcher_candidates[0]
+            self.pitcher = self.get_player(player, lineupcode)
+            self.all_players[self.pitcher.id] = self.pitcher
+        else:
+            logger.warning('No pitcher found in boxscore for team %s', id)
+            self.pitcher = None
         self.primary_color = primary_color
         self.secondary_color = secondary_color
         self.image = False
-        self.all_players[self.pitcher.id] = self.pitcher
         if logo_url:
-            self.image = Image.open(BytesIO(self.game.session.get(logo_url).content))
+            self.image = Image.open(BytesIO(self.game.session.get(logo_url, timeout=TIMEOUT).content))
 
     def update(self, data):
         for lineupcode, player in data.items():
@@ -215,7 +408,7 @@ class Team:
 
     def get_lineup(self):
         lineup = sorted([player for x, player in self.lineup.items()], key= lambda p: p.batting_order)
-        if self.pitcher not in lineup:
+        if self.pitcher and self.pitcher not in lineup:
             lineup.append(self.pitcher)
         return lineup
 
@@ -244,14 +437,14 @@ class Game:
         try:
             self.session = requests.Session()
             if self.mode == 'live':
-                last_play = self.session.get(LATEST_PLAY_URL % self.id, headers=HEADERS)
+                last_play = self.session.get(LATEST_PLAY_URL % self.id, headers=HEADERS, timeout=TIMEOUT)
                 last_play = int(last_play.json())
                 self.current_play = last_play
-                data = self.session.get(PLAY_URL % (self.id, last_play), headers=HEADERS)
+                data = self.session.get(PLAY_URL % (self.id, last_play), headers=HEADERS, timeout=TIMEOUT)
                 data = data.json()
             else:
                 self.current_play = 1
-                data = self.session.get(PLAY_URL % (self.id, self.current_play), headers=HEADERS)
+                data = self.session.get(PLAY_URL % (self.id, self.current_play), headers=HEADERS, timeout=TIMEOUT)
                 data = data.json()
             self.beginning = int(data.get('playdata')[0].get('t'))
             self.data = data
@@ -274,7 +467,7 @@ class Game:
         self.away.update(data.get('boxscore'))
 
         self.batter = self.home.lineup.get(batterid) or self.away.lineup.get(batterid)
-        self.pitcher = self.home.pitcher if self.home.pitcher.id == pitcherid else self.away.pitcher
+        self.pitcher = self.home.pitcher if self.home.pitcher and self.home.pitcher.id == pitcherid else self.away.pitcher
         self.score_home = data.get('linescore').get('hometotals').get('R')
         self.score_away = data.get('linescore').get('awaytotals').get('R')
         self.inning = data.get('situation')['currentinning'].split()[-1]
@@ -290,24 +483,16 @@ class Game:
         self.strikes = data.get('situation').get('strikes')
 
     def get_current_batter(self):
-        self.batter.team.primary_color
-        main_color = self.batter.team.primary_color
-        second_color = "White"
-        third_color = self.batter.team.secondary_color
-        text_main_color = get_text_color(main_color)
-        text_second_color = "Black"
-        image = Image.new('RGBA', (2500, 500))
-        draw = ImageDraw.Draw(image)
-        draw.polygon([(250, 100), (2500, 100), (2400, 250), (250, 250)], fill=main_color)
-        draw.polygon([(250, 250), (2400, 250), (2300, 400), (250, 400)], fill=second_color)
-        if self.batter.image:
-            draw.ellipse((0, 0) + (500, 500), fill=third_color)
-        else:
-            draw.pieslice([100, 100, 400, 400], start=180, end=270, fill=main_color)
-            draw.pieslice([100, 100, 400, 400], start=90, end=180, fill=second_color)
-        font_name = ImageFont.truetype(FONTS,80)
-        font_stat = ImageFont.truetype(FONTS,60)
-        draw.text((550, 120), '%s. %s - %s' % (self.batter.batting_order, self.batter.name, self.batter.position), fill=text_main_color, font=font_name)
+        """Two slanted bars plus a circular photo/placeholder badge, floating
+        directly on the transparent overlay (no card background of its own)."""
+        team_primary = self.batter.team.primary_color or SCOREBUG_ACCENT
+        team_secondary = self.batter.team.secondary_color or SCOREBUG_ACCENT
+        main_color = _svg_hex(team_primary)
+        second_color = 'white'
+        third_color = _svg_hex(team_secondary)
+        text_main_color = _svg_hex(get_text_color(team_primary))
+
+        # What the stat line says.
         if self.batter.pa:
             player_label = 'This game: %s for %s' % (self.batter.h, self.batter.ab)
             if self.batter.hr:
@@ -330,138 +515,286 @@ class Game:
                     player_label += ', %s %s' % (self.batter.stats.get(stat), label)
         if config.has_option('baseball', 'test_time') and config.get('baseball', 'test_time'):
             player_label = str(datetime.now())
-        draw.text((550, 270), player_label, fill=text_second_color, font=font_stat)
+
+        width, height = BATTER_CARD_SIZE
+        name_bar_top = BATTER_NAME_BAR_TOP
+        name_bar_bottom = name_bar_top + BATTER_BAR_HEIGHT
+        stat_bar_bottom = name_bar_bottom + BATTER_BAR_HEIGHT
+
+        # The two bars' four corners, named the same way on both: left edge
+        # at the photo (always hidden, so left sharp), a shared middle
+        # vertex at the divider seam (also left sharp, like the scorebug's
+        # own internal cell edges), and the one genuinely "outer" corner of
+        # each bar rounded -- same treatment as the scorebug's card border,
+        # which only softens the whole card's outline, not every internal
+        # edge.
+        name_tl, name_tr = (BATTER_BAR_LEFT, name_bar_top), (width, name_bar_top)
+        name_br, name_bl = (width - BATTER_BAR_SLANT, name_bar_bottom), (BATTER_BAR_LEFT, name_bar_bottom)
+        stat_tl, stat_tr = (BATTER_BAR_LEFT, name_bar_bottom), (width - BATTER_BAR_SLANT, name_bar_bottom)
+        stat_br, stat_bl = (width - 2 * BATTER_BAR_SLANT, stat_bar_bottom), (BATTER_BAR_LEFT, stat_bar_bottom)
+        R = BATTER_CORNER_RADIUS
+
+        parts = []
+        add = parts.append
+        add(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">')
+        add(f'<path d="{_svg_rounded_quad_path(name_tl, name_tr, name_br, name_bl, r2=R)}" fill="{main_color}"/>')
+        add(f'<path d="{_svg_rounded_quad_path(stat_tl, stat_tr, stat_br, stat_bl, r3=R)}" fill="{second_color}"/>')
+
+        # Divider between the two bars, same style as the scorebug's row
+        # dividers -- the bars' own edges already meet exactly at this seam
+        # (bar 1's bottom edge and bar 2's top edge both span x=250..2400 at
+        # y=250), so this just draws a visible line along it.
+        add(_svg_line(BATTER_BAR_LEFT, name_bar_bottom, width - BATTER_BAR_SLANT, name_bar_bottom, width=6))
+
+        # Outline around the bars, same style as the scorebug's card border --
+        # left open on the side facing the photo (no segment at
+        # x=BATTER_BAR_LEFT), since the circular photo already has its own
+        # clear edge there. Rounds the same two corners as the bars' fill
+        # above, so the stroke traces their edge exactly. Drawn before the
+        # photo/placeholder badge below so that badge -- whose circle extends
+        # past x=BATTER_BAR_LEFT -- stays on top of it rather than the
+        # border cutting across the image or the ring.
+        tr_in, tr_out = _svg_corner_cut(name_tr, name_tl, R), _svg_corner_cut(name_tr, name_br, R)
+        br_in, br_out = _svg_corner_cut(stat_br, stat_tr, R), _svg_corner_cut(stat_br, stat_bl, R)
+        border_path = (f'M {name_tl[0]},{name_tl[1]} '
+                        f'L {tr_in[0]:.1f},{tr_in[1]:.1f} Q {name_tr[0]},{name_tr[1]} {tr_out[0]:.1f},{tr_out[1]:.1f} '
+                        f'L {br_in[0]:.1f},{br_in[1]:.1f} Q {stat_br[0]},{stat_br[1]} {br_out[0]:.1f},{br_out[1]:.1f} '
+                        f'L {stat_bl[0]},{stat_bl[1]}')
+        add(f'<path d="{border_path}" fill="none" stroke="{CARD_BORDER_COLOR}" stroke-width="6"/>')
+
+        portrait_center = BATTER_PORTRAIT_SIZE // 2
         if self.batter.image:
-            image.paste(self.batter.image, (15, 15), self.batter.image)
-        return image
+            # No extra outline here: the photo's own circular edge already
+            # reads as a clear boundary against the backdrop.
+            add(f'<circle cx="{portrait_center}" cy="{portrait_center}" r="{portrait_center}" fill="{third_color}"/>')
+        else:
+            r = BATTER_PORTRAIT_PLACEHOLDER_RADIUS
+            add(f'<path d="{_svg_pie_slice(portrait_center, portrait_center, r, 180, 270)}" fill="{main_color}"/>')
+            add(f'<path d="{_svg_pie_slice(portrait_center, portrait_center, r, 90, 180)}" fill="{second_color}"/>')
+            # Edge for the badge's curved (left) side, matching the card
+            # border's style -- the photo gets this for free from its own
+            # circle/ring, but the badge has no edge of its own. Its flat
+            # side (the diameter, at x=BATTER_BAR_LEFT) needs no line: it
+            # meets the bars there, in matching colors.
+            add(f'<path d="{_svg_arc(portrait_center, portrait_center, r, 90, 270)}" fill="none" stroke="{CARD_BORDER_COLOR}" stroke-width="6"/>')
+            # The badge is split into the same two colors at the same seam
+            # as the bars, so the divider continues across it too, all the
+            # way to the badge's own left edge.
+            add(_svg_line(portrait_center - r, name_bar_bottom, BATTER_BAR_LEFT, name_bar_bottom, width=6))
+
+        # Vertically centered in each bar: baseline sits `0.35 * font-size`
+        # below the bar's own vertical midpoint, the usual approximation for
+        # a single line of text (accounts for the gap between a font's
+        # baseline and its true visual center).
+        name_line = f'{self.batter.batting_order}. {self.batter.name} - {self.batter.position}'
+        name_bar_mid = (name_bar_top + name_bar_bottom) / 2
+        stat_bar_mid = (name_bar_bottom + stat_bar_bottom) / 2
+        add(_svg_text(BATTER_TEXT_LEFT, name_bar_mid + FONT_SIZE_BATTER_NAME * 0.35,
+                       name_line, FONT_SIZE_BATTER_NAME, text_main_color))
+        add(_svg_text(BATTER_TEXT_LEFT, stat_bar_mid + FONT_SIZE_BATTER_STAT * 0.35,
+                       player_label, FONT_SIZE_BATTER_STAT, 'black'))
+
+        if self.batter.image:
+            w, h = self.batter.image.size
+            add(f'<image href="{_image_data_uri(self.batter.image)}" x="{BATTER_PORTRAIT_PADDING}" y="{BATTER_PORTRAIT_PADDING}" width="{w}" height="{h}"/>')
+
+        add('</svg>')
+
+        png_bytes = cairosvg.svg2png(bytestring=''.join(parts).encode())
+        return Image.open(BytesIO(png_bytes)).convert('RGBA')
 
     def get_lineup(self, team, filename):
-        font_team = ImageFont.truetype(FONTS, 60)
-        font_name = ImageFont.truetype(FONTS, 30)
-        bg_color = team.primary_color + (220,)
-        pitcher_color = team.secondary_color + (220,)
-        text_main_color = get_text_color(bg_color)
-        text_pitcher_color = get_text_color(pitcher_color)
-        height = 50
-        width = 500
-        width2 = 450
-        space = 10
-        logo_height = 100
-        image = Image.new('RGBA', (width, logo_height + (height + space) * 10))
-        draw = ImageDraw.Draw(image)
+        """Header (team logo + name) above the roster: one bordered, rounded
+        row per player, separated by the gap between them rather than a
+        divider line."""
+        team_primary = team.primary_color or SCOREBUG_ACCENT
+        team_secondary = team.secondary_color or SCOREBUG_ACCENT
+        bg_hex = _svg_hex(team_primary)
+        pitcher_hex = _svg_hex(team_secondary)
+        text_main_color = _svg_hex(get_text_color(team_primary))
+        text_pitcher_color = _svg_hex(get_text_color(team_secondary))
+        row_opacity = 220 / 255  # semi-transparent so the rows read as a color-coded overlay, not a solid block
 
-        draw.polygon([(space, space), (width - space, space), (width - space, logo_height - space), (space, logo_height - space)], fill=bg_color)
-        draw.text((150, 10), filename.upper(), fill=text_main_color, font=font_team)
+        width = LINEUP_CARD_WIDTH
+        height = LINEUP_HEADER_HEIGHT + (LINEUP_ROW_HEIGHT + LINEUP_PADDING) * LINEUP_MAX_ROWS
 
-        position = logo_height
+        parts = []
+        add = parts.append
+        add(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">')
 
+        add(f'<rect x="{LINEUP_PADDING}" y="{LINEUP_PADDING}" width="{width - 2 * LINEUP_PADDING}" '
+            f'height="{LINEUP_HEADER_HEIGHT - 2 * LINEUP_PADDING}" fill="{bg_hex}" fill-opacity="{row_opacity}" '
+            f'rx="{LINEUP_CORNER_RADIUS}"/>')
+        add(_svg_logo_tag(team.image, int(LINEUP_PADDING * 1.5), int(LINEUP_PADDING * 1.5),
+                           LINEUP_HEADER_HEIGHT - 3 * LINEUP_PADDING, LINEUP_HEADER_HEIGHT - 3 * LINEUP_PADDING))
+        header_baseline = LINEUP_HEADER_HEIGHT / 2 + FONT_SIZE_LINEUP_HEADER * 0.35
+        add(_svg_text(150, header_baseline, filename.upper(), FONT_SIZE_LINEUP_HEADER, text_main_color))
+
+        position = LINEUP_HEADER_HEIGHT
         for player in team.get_lineup():
-            color = bg_color
-            text_color = text_main_color
-            if player.batting_order == '0':
-                color = pitcher_color
-                text_color = text_pitcher_color
+            is_pitcher = player.batting_order == '0'
+            row_fill = pitcher_hex if is_pitcher else bg_hex
+            row_text = text_pitcher_color if is_pitcher else text_main_color
+            row_baseline = position + LINEUP_ROW_HEIGHT / 2 + FONT_SIZE_LINEUP_LABEL * 0.35
 
-            draw.polygon([(0, position), (width, position), (width2, height + position), (0, height + position)], fill=color)
-            if player.batting_order != '0':
-                draw.text((10, position), player.batting_order, fill=text_color, font=font_name)
+            # Each row is its own rounded chip (all 4 corners, not just the
+            # roster block's outer ones) -- the slant otherwise leaves every
+            # row with a sharp, pointy corner on the right -- outlined with
+            # the same border style used elsewhere on the card.
+            row_top, row_bottom = position, position + LINEUP_ROW_HEIGHT
+            row_tl, row_tr = (0, row_top), (width, row_top)
+            row_br, row_bl = (width - LINEUP_ROW_SLANT, row_bottom), (0, row_bottom)
+            row_path = _svg_rounded_quad_path(row_tl, row_tr, row_br, row_bl,
+                                               r1=LINEUP_CORNER_RADIUS, r2=LINEUP_CORNER_RADIUS,
+                                               r3=LINEUP_CORNER_RADIUS, r4=LINEUP_CORNER_RADIUS)
+            add(f'<path d="{row_path}" fill="{row_fill}" fill-opacity="{row_opacity}"/>')
+            add(f'<path d="{row_path}" fill="none" stroke="{CARD_BORDER_COLOR}" stroke-width="2"/>')
+            if not is_pitcher:
+                add(_svg_text(LINEUP_BATTING_ORDER_X, row_baseline, player.batting_order, FONT_SIZE_LINEUP_LABEL, row_text))
+
+            # A long name still needs to fit before LINEUP_NAME_MAX_WIDTH
+            # instead of overflowing into the position column. SVG text
+            # isn't measured before rendering, so there's no way to know its
+            # true width up front -- this character-count estimate is kept
+            # deliberately conservative (erring toward "compress it") and
+            # only *decides whether* to compress; the actual fit is then
+            # guaranteed exactly by textLength/lengthAdjust below, not by
+            # the estimate itself.
             player_name = '%s %s.' % (player.lastname.upper(), player.firstname[0])
-            for font_size in reversed(range(30)):
-                font_player = ImageFont.truetype(FONTS, font_size)
-                player_name_length = draw.textlength(player_name, font_player)
-                if player_name_length < 350:
-                    break
-            draw.text((50, position), player_name, fill=text_color, font=font_player)
-            draw.text((400, position), player.position, fill=text_color, font=font_name)
-            position += space + height
-        width, height = team.image.size
-        team_image = team.image.resize((int((logo_height - 3 * space) * width / height), (logo_height - 3 * space)))
-        try:
-            image.paste(team_image, (int(space * 1.5), int(space * 1.5)), team_image)
-        except:
-            image.paste(team_image, (int(space * 1.5), int(space * 1.5)))
-        return image
+            avg_char_width = FONT_SIZE_LINEUP_LABEL * 0.62
+            name_max_width = LINEUP_NAME_MAX_WIDTH if len(player_name) * avg_char_width > LINEUP_NAME_MAX_WIDTH else None
+            add(_svg_text(LINEUP_NAME_X, row_baseline, player_name, FONT_SIZE_LINEUP_LABEL, row_text, max_width=name_max_width))
+            add(_svg_text(LINEUP_POSITION_X, row_baseline, player.position, FONT_SIZE_LINEUP_LABEL, row_text))
+            position += LINEUP_PADDING + LINEUP_ROW_HEIGHT
+
+        add('</svg>')
+        png_bytes = cairosvg.svg2png(bytestring=''.join(parts).encode())
+        return Image.open(BytesIO(png_bytes)).convert('RGBA')
 
     def get_scorebug(self):
+        """Build the scorebug as an SVG string from the game's current state
+        and rasterize it with cairosvg. Content is computed fresh on every
+        call -- make_overlay() just calls this again each time it needs an
+        up-to-date scorebug."""
         home_score = str(self.score_home)
         away_score = str(self.score_away)
+        pitcher_lastname = self.pitcher.lastname if self.pitcher else ''
+        pitcher_pitches = self.pitcher.pitches if self.pitcher else 0
 
-        bg_color = (0, 0, 0, 180)
-        text_color = (255, 255, 255, 200)
-        border_base_color = (255, 255, 255, 170)
-        base_runner_color = (255, 255, 128, 255)
-        image = Image.new('RGBA', (1000, 750))
+        left_w = SCOREBUG_LOGO_COL_W + SCOREBUG_SCORE_COL_W
+        width = left_w + SCOREBUG_RIGHT_W
+        top_h = SCOREBUG_ROW_H * 2
+        height = top_h + SCOREBUG_PITCHER_ROW_H
 
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle(((0, 140), (1000, 260)), radius=30, fill=bg_color)
-        draw.rounded_rectangle(((0, 300), (1000, 750)), radius=30, fill=bg_color)
-        draw.rectangle(((0, 300), (600, 450)), fill=self.away.primary_color)
-        draw.rectangle(((0, 450), (600, 600)), fill=self.home.primary_color)
+        # Truncate the pitcher's surname with an ellipsis if it wouldn't fit
+        # before the pitch count on the right -- without this, a long name
+        # either overlaps "P:57" or gets hard-clipped by the rounded corner
+        # mask mid-letter. This is a rough character-count estimate (SVG text
+        # isn't measured before rendering), tuned generously to avoid
+        # clipping rather than to pack the text as tightly as possible.
+        name_max_right = width - 110
+        max_chars = max(int((name_max_right - 16) / 15), 3)
+        if len(pitcher_lastname) > max_chars:
+            pitcher_lastname = pitcher_lastname[:max_chars - 1].rstrip() + '…'
 
-        l1 = 156
-        l2 = 71
-        offset_x = 650
-        offset_y = 320
-        first_base = base_runner_color if self.runner1 else None
-        second_base = base_runner_color if self.runner2 else None
-        thrid_base = base_runner_color if self.runner3 else None
+        parts = []
+        add = parts.append
+        add(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">')
+        add(f'<defs><clipPath id="card-clip"><rect width="{width}" height="{height}" rx="{SCOREBUG_RADIUS}"/></clipPath></defs>')
+        add('<g clip-path="url(#card-clip)">')
+        add(_svg_rect(0, 0, width, height, '#f7f7f8'))
 
-        # bases
-        draw.polygon([
-            (l1 + l1 - l2 + offset_x, l1 - l2 + offset_y),
-            (l1 + l1 + offset_x, l1 + offset_y),
-            (l1 + l1 - l2 + offset_x, l1 + l2 + offset_y),
-            (l1 + l1 - l2 - l2 + offset_x, l1 + offset_y),
-            ], fill=first_base, outline=border_base_color, width=10)
-        draw.polygon([
-            (l1 + offset_x, 0 + offset_y),
-            (l1 + l2 + offset_x, l2 + offset_y),
-            (l1 + offset_x, l2 + l2 + offset_y),
-            (l1 - l2 + offset_x, l2 + offset_y),
-            ], fill=second_base, outline=border_base_color, width=10)
-        draw.polygon([
-            (l2 + offset_x, l1 - l2 + offset_y),
-            (l2 + l2 + offset_x, l1 + offset_y),
-            (l2 + offset_x, l1 + l2 + offset_y),
-            (0 + offset_x, l1 + offset_y),
-            ], fill=thrid_base, outline =border_base_color, width=10)
+        # Logo cells (white) + score cells. Each team's own primary color is
+        # the score cell's background, with the text color picked
+        # automatically for contrast (get_text_color), so a team with a
+        # light color doesn't end up with unreadable white-on-white.
+        add(_svg_rect(0, 0, SCOREBUG_LOGO_COL_W, top_h, 'white'))
+        add(_svg_line(0, SCOREBUG_ROW_H, SCOREBUG_LOGO_COL_W, SCOREBUG_ROW_H))
+        add(_svg_logo_tag(self.away.image, 4, 4, SCOREBUG_LOGO_COL_W - 8, SCOREBUG_ROW_H - 8))
+        add(_svg_logo_tag(self.home.image, 4, SCOREBUG_ROW_H + 4, SCOREBUG_LOGO_COL_W - 8, SCOREBUG_ROW_H - 8))
 
-        font_team = ImageFont.truetype(FONTS, 120)
-        font_name = ImageFont.truetype(FONTS, 60)
-        font_out = ImageFont.truetype(FONTS, 100)
-        font_score = ImageFont.truetype(FONTS, 120)
+        away_bg = self.away.primary_color or SCOREBUG_ACCENT
+        home_bg = self.home.primary_color or SCOREBUG_ACCENT
+        away_text = _svg_hex(get_text_color(away_bg))
+        home_text = _svg_hex(get_text_color(home_bg))
+        add(_svg_rect(SCOREBUG_LOGO_COL_W, 0, SCOREBUG_SCORE_COL_W, SCOREBUG_ROW_H, _svg_hex(away_bg)))
+        add(_svg_rect(SCOREBUG_LOGO_COL_W, SCOREBUG_ROW_H, SCOREBUG_SCORE_COL_W, SCOREBUG_ROW_H, _svg_hex(home_bg)))
+        add(_svg_line(SCOREBUG_LOGO_COL_W, SCOREBUG_ROW_H, left_w, SCOREBUG_ROW_H))
 
-        away_score_length = draw.textlength(away_score, font_score)
-        home_score_length = draw.textlength(home_score, font_score)
-        get_text_color(self.away.primary_color)
+        score_right = left_w - 16
+        code_left = SCOREBUG_LOGO_COL_W + 14
+        add(_svg_text(code_left, SCOREBUG_ROW_H / 2 + 10, self.away.code.upper()[:3], FONT_SIZE_SCOREBUG_CODE, away_text, opacity='0.9'))
+        add(_svg_text(score_right, SCOREBUG_ROW_H / 2 + 16, away_score, FONT_SIZE_SCOREBUG_SCORE, away_text, anchor='end'))
+        add(_svg_text(code_left, SCOREBUG_ROW_H + SCOREBUG_ROW_H / 2 + 10, self.home.code.upper()[:3], FONT_SIZE_SCOREBUG_CODE, home_text, opacity='0.9'))
+        add(_svg_text(score_right, SCOREBUG_ROW_H + SCOREBUG_ROW_H / 2 + 16, home_score, FONT_SIZE_SCOREBUG_SCORE, home_text, anchor='end'))
 
-        draw.text((20, 300), self.away.code.upper()[:3], fill=get_text_color(self.away.primary_color), font=font_team)
-        draw.text((500 - away_score_length, 300), away_score, fill=get_text_color(self.away.primary_color), font=font_score)
-        draw.text((20, 450), self.home.code.upper()[:3], fill=get_text_color(self.home.primary_color), font=font_team)
-        draw.text((500 - home_score_length, 450), home_score, fill=get_text_color(self.home.primary_color), font=font_score)
-        for font_size in reversed(range(60)):
-            font_pitcher = ImageFont.truetype(FONTS, font_size)
-            pitcher_name_length = draw.textlength(self.pitcher.name, font_pitcher)
-            if pitcher_name_length < 700:
-                break
-        draw.text((20, 147), self.pitcher.name, fill=text_color, font=font_pitcher)
-        draw.text((800, 147), 'P: %s' % self.pitcher.pitches, fill=text_color, font=font_name)
-        # inning
-        draw.polygon([(70, 675), (70 + 40, 675), (70 + 20, 675 + (-40 if self.inning_top else 40)),], fill=border_base_color)
-        draw.text((70 + 15 + 40, 600), self.inning, fill=text_color, font=font_team)
-        draw.text((330, 600), str(self.outs), fill=text_color, font=font_team)
-        draw.text((410, 600), 'out', fill=text_color, font=font_out)
-        count = '%s-%s' % (self.balls, self.strikes)
-        count_length = draw.textlength(count, font_team)
-        draw.text((l1 + offset_x - count_length / 2, 600), count, fill=text_color, font=font_team)
-        return image
+        # Right panel: inning top-right (both arrows always drawn, only the
+        # active one lit), bases diamond + outs dots centered underneath,
+        # count to the right.
+        add(_svg_rect(left_w, 0, SCOREBUG_RIGHT_W, top_h, _svg_hex(SCOREBUG_ACCENT)))
+        add(_svg_line(left_w, 0, left_w, top_h))
+
+        inning_right = width - 22
+        inning_y = 42
+        arrow_w, arrow_h = 15, 11
+        arrow_x = inning_right - 64
+        top_color, top_opacity = ('#ffb53a', 1) if self.inning_top else ('white', 0.3)
+        bottom_color, bottom_opacity = ('#ffb53a', 1) if not self.inning_top else ('white', 0.3)
+        top_apex_y = inning_y - 15 - arrow_h
+        add(f'<polygon points="{arrow_x},{inning_y - 15} {arrow_x + arrow_w},{inning_y - 15} {arrow_x + arrow_w / 2},{top_apex_y}" '
+            f'fill="{top_color}" fill-opacity="{top_opacity}"/>')
+        bottom_apex_y = inning_y - 3 + arrow_h
+        add(f'<polygon points="{arrow_x},{inning_y - 3} {arrow_x + arrow_w},{inning_y - 3} {arrow_x + arrow_w / 2},{bottom_apex_y}" '
+            f'fill="{bottom_color}" fill-opacity="{bottom_opacity}"/>')
+        add(_svg_text(inning_right, inning_y, self.inning, FONT_SIZE_SCOREBUG_INNING, '#ffb53a', anchor='end'))
+
+        # Bases: 3 equal diamonds spaced along the same diagonal axes (so
+        # they stay visually "aligned"), offset by more than their radius so
+        # there's a gap between them instead of a shared edge.
+        dcx = left_w + SCOREBUG_RIGHT_W / 2 - 25  # nudged left so bases+outs sit centered in their own space
+        dr = SCOREBUG_DIAMOND_RADIUS
+        offset = dr + SCOREBUG_DIAMOND_GAP
+        second_center = (dcx, 56)                                              # 2nd: top
+        first_center = (second_center[0] + offset, second_center[1] + offset)  # 1st: lower-right
+        third_center = (second_center[0] - offset, second_center[1] + offset)  # 3rd: lower-left
+        bases = ((first_center, self.runner1), (second_center, self.runner2), (third_center, self.runner3))
+        for (bx, by), occupied in bases:
+            points = _svg_diamond_points(bx, by, dr)
+            if occupied:
+                add(f'<polygon points="{points}" fill="#ffb53a"/>')
+            else:
+                add(f'<polygon points="{points}" fill="none" stroke="white" stroke-opacity="0.8" stroke-width="2.5"/>')
+
+        pyramid_bottom = first_center[1] + dr  # bottom vertex of 1st/3rd (lowest point of the shape)
+        outs_y = pyramid_bottom + 21
+        dot_gap = 22
+        for i in range(2):
+            filled = i < self.outs
+            dot_x = dcx - dot_gap / 2 + i * dot_gap
+            dot_fill = '#ffb53a' if filled else 'none'
+            add(f'<circle cx="{dot_x}" cy="{outs_y}" r="{SCOREBUG_BASE_MARKER_RADIUS}" fill="{dot_fill}" stroke="white" stroke-width="2"/>')
+
+        count = f'{self.balls}-{self.strikes}'
+        add(_svg_text(width - 16, outs_y + 12, count, FONT_SIZE_SCOREBUG_COUNT, 'white', anchor='end'))
+
+        # Bottom pitcher strip
+        add(_svg_line(0, top_h, width, top_h))
+        add(_svg_text(16, top_h + SCOREBUG_PITCHER_ROW_H / 2 + 8, pitcher_lastname, FONT_SIZE_SCOREBUG_PITCHER, '#1a1a1e'))
+        add(_svg_text(width - 16, top_h + SCOREBUG_PITCHER_ROW_H / 2 + 7, f'P:{pitcher_pitches}', FONT_SIZE_SCOREBUG_PITCH_COUNT, '#8a8a90', anchor='end'))
+
+        add('</g>')
+        add(f'<rect x="1" y="1" width="{width - 2}" height="{height - 2}" rx="{SCOREBUG_RADIUS}" fill="none" stroke="{CARD_BORDER_COLOR}" stroke-width="3"/>')
+        add('</svg>')
+
+        png_bytes = cairosvg.svg2png(bytestring=''.join(parts).encode())
+        return Image.open(BytesIO(png_bytes)).convert('RGBA')
 
     def make_overlay(self):
         image = Image.new('RGBA', self.resolution)
         if not self.game_started:
             for team_logo in [('away_logo', 3.70), ('home_logo', 0.30)]:
                 try:
-                    logo = Image.open(BytesIO(requests.get(self.game_info.get(team_logo[0])).content))
+                    logo = Image.open(BytesIO(requests.get(self.game_info.get(team_logo[0]), timeout=TIMEOUT).content))
                     width, height = logo.size
                     logo = logo.resize((int(self.resolution[0] / 5.00), int((self.resolution[0] / 5.00) * height / width)))
                     try:
@@ -473,7 +806,7 @@ class Game:
 
         elif self.current_play > 1:
             scorebug = self.get_scorebug()
-            ratio = self.resolution[0] / scorebug.size[0] / 6
+            ratio = self.resolution[0] / scorebug.size[0] / SCOREBUG_DISPLAY_SCALE
             scorebug = scorebug.resize((int(scorebug.size[0] * ratio), int(scorebug.size[1] * ratio)))
             image.paste(scorebug, (20, self.resolution[1] - scorebug.size[1] - 20), scorebug)
             if self.inning != 'F':
@@ -663,7 +996,7 @@ class Game:
             if self.mode == 'replay' and self.replay_mode == 'realtime':
                 current_time = self.beginning + (int(time.time() * 1000) - start)
                 while self.play_time < current_time:
-                    data = self.session.get(PLAY_URL % (self.id, self.current_play), headers=HEADERS)
+                    data = self.session.get(PLAY_URL % (self.id, self.current_play), headers=HEADERS, timeout=TIMEOUT)
                     try:
                         data = data.json()
                     except Exception:
@@ -675,7 +1008,7 @@ class Game:
                     self.current_play += 1
                 time.sleep(0.5)
             elif self.mode == 'replay' and self.replay_mode == 'sequence':
-                data = self.session.get(PLAY_URL % (self.id, self.current_play), headers=HEADERS)
+                data = self.session.get(PLAY_URL % (self.id, self.current_play), headers=HEADERS, timeout=TIMEOUT)
                 try:
                     data = data.json()
                 except:
@@ -686,13 +1019,13 @@ class Game:
                 self.current_play += 1
                 time.sleep(2)
             elif self.mode == 'live':
-                last_play = self.session.get(LATEST_PLAY_URL % self.id, headers=HEADERS)
+                last_play = self.session.get(LATEST_PLAY_URL % self.id, headers=HEADERS, timeout=TIMEOUT)
                 last_play = int(last_play.json())
                 if self.current_play == last_play:
                     time.sleep(1)
                     continue
                 self.current_play = last_play
-                data = self.session.get(PLAY_URL % (self.id, last_play), headers=HEADERS)
+                data = self.session.get(PLAY_URL % (self.id, last_play), headers=HEADERS, timeout=TIMEOUT)
                 try:
                     data = data.json()
                 except:
